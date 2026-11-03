@@ -246,6 +246,20 @@ jobs:
           else
             echo "scripts/verifyNpmDependencies.sh not present on this platform ref, skipped"
           fi
+      - name: Install the Vaadin license key
+        # vaadin-prod-bundle-unoptimized builds its frontend bundle without
+        # optimization, so every commercial component on the classpath counts
+        # as used and the Vaadin plugin checks for a license at build time.
+        # The secret holds the content of a ~/.vaadin/proKey file.
+        env:
+          PRO_KEY: ${{ secrets.VAADIN_PRO_KEY }}
+        run: |
+          if [ -n "$PRO_KEY" ]; then
+            mkdir -p ~/.vaadin
+            printf '%s' "$PRO_KEY" > ~/.vaadin/proKey
+          else
+            echo "VAADIN_PRO_KEY is not set: the vaadin-prod-bundle-unoptimized build will fail" | tee -a $GITHUB_STEP_SUMMARY
+          fi
       - name: Build the platform
         working-directory: platform
         run: mvn install -B -ntp -nsu -Doss -DskipTests
