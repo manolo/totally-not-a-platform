@@ -246,20 +246,20 @@ jobs:
           else
             echo "scripts/verifyNpmDependencies.sh not present on this platform ref, skipped"
           fi
-      - name: Install the Vaadin license key
+      - name: Install TestBench license
         # vaadin-prod-bundle-unoptimized builds its frontend bundle without
         # optimization, so every commercial component on the classpath counts
         # as used and the Vaadin plugin checks for a license at build time.
-        # The secret holds the content of a ~/.vaadin/proKey file.
+        # Same step as flow-components' validation.yml: TB_LICENSE is
+        # user/key, written as the ~/.vaadin/proKey file.
+        if: env.TB_LICENSE != ''
         env:
-          PRO_KEY: ${{ secrets.VAADIN_PRO_KEY }}
+          TB_LICENSE: ${{ secrets.TB_LICENSE }}
         run: |
-          if [ -n "$PRO_KEY" ]; then
-            mkdir -p ~/.vaadin
-            printf '%s' "$PRO_KEY" > ~/.vaadin/proKey
-          else
-            echo "VAADIN_PRO_KEY is not set: the vaadin-prod-bundle-unoptimized build will fail" | tee -a $GITHUB_STEP_SUMMARY
-          fi
+          mkdir -p ~/.vaadin
+          user="${TB_LICENSE%%/*}"
+          key="${TB_LICENSE#*/}"
+          echo "{\"username\":\"${user}\",\"proKey\":\"${key}\"}" > ~/.vaadin/proKey
       - name: Build the platform
         working-directory: platform
         run: mvn install -B -ntp -nsu -Doss -DskipTests
