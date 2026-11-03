@@ -1,20 +1,22 @@
 name: Assemble Platform Snapshot
 
-# From ready code to a published platform snapshot in one run:
+# From ready code to a validated platform snapshot in one run:
 #
-#   resolve ──> build-flow ──> assemble-platform ──> publish
+#   resolve ──> build-flow ──> assemble-platform
 #
 # resolve finds the newest green commit of vaadin/flow main (its merge-queue
-# validation passed). build-flow checks that exact commit out and deploys it as
+# validation passed). build-flow checks that exact commit out and builds it as
 # the regular X.Y-SNAPSHOT, skipping the tests that already passed for this
 # SHA. assemble-platform pins flow to that snapshot in vaadin/platform's
-# versions.json, generates the BOM set, builds it and runs the platform's fast
-# validations. publish writes the manifest that maps the mutable -SNAPSHOT
-# alias to the exact timestamped builds, commits it, and creates a GitHub
-# pre-release carrying it.
+# versions.json, generates the BOM set, builds it against the just-built flow
+# and runs the platform's fast validations.
 #
-# This replaces the TeamCity flow and platform snapshot builds: same artifacts
-# in the same repository, but always from a green commit and always traceable.
+# Nothing is deployed yet: the flow artifacts travel to the platform job as a
+# workflow artifact, and the platform resolves them from the local Maven
+# repository (-nsu keeps the remote TeamCity snapshot from shadowing them).
+# Deploying to the snapshot repository and publishing the manifest is the next
+# step once this validation pipeline has proven itself; the scripts for it
+# (snapshot-id.js, write-manifest.js) are already in place.
 
 on:
   workflow_dispatch:
@@ -27,23 +29,13 @@ on:
         description: vaadin/platform ref to assemble from
         required: false
         default: main
-      dry-run:
-        description: Build everything but deploy and publish nothing
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-# One assembly at a time, and a running one is never cancelled: a deploy
-# cancelled halfway would leave the snapshot repository in a mixed state.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
-
-env:
-  MAVEN_SNAPSHOT_DEPLOY_URL: ${{ vars.MAVEN_SNAPSHOT_DEPLOY_URL }}
-  MAVEN_SNAPSHOT_READ_URL: ${{ vars.MAVEN_SNAPSHOT_READ_URL || 'https://maven.vaadin.com/vaadin-prereleases' }}
 
 jobs:
   resolve:
@@ -100,17 +92,7 @@ jobs:
     timeout-minutes: 90
     outputs:
       version: ${{ steps.version.outputs.version }}
-      snapshot-id: ${{ steps.snapshot.outputs.snapshot-id }}
     steps:
-      - name: Check configuration
-        if: ${{ !inputs.dry-run }}
-        env:
-          SNAPSHOT_USERNAME: ${{ secrets.SNAPSHOT_USERNAME }}
-          SNAPSHOT_PASSWORD: ${{ secrets.SNAPSHOT_PASSWORD }}
-        run: |
-          [ -z "$MAVEN_SNAPSHOT_DEPLOY_URL" ] || [ -z "$SNAPSHOT_USERNAME" ] || [ -z "$SNAPSHOT_PASSWORD" ] \
-            && echo "The MAVEN_SNAPSHOT_DEPLOY_URL variable or the SNAPSHOT_USERNAME / SNAPSHOT_PASSWORD secrets are not defined in ${{ github.repository }}" \
-            | tee -a $GITHUB_STEP_SUMMARY && exit 1 || exit 0
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
         with:
@@ -123,11 +105,6 @@ jobs:
         with:
           java-version-file: flow/.tool-versions
           distribution: temurin
-          # Writes the settings.xml server entry the deploy authenticates
-          # with; the credential values are read from the environment there.
-          server-id: vaadin-snapshots
-          server-username: SNAPSHOT_USERNAME
-          server-password: SNAPSHOT_PASSWORD
       - uses: actions/cache/restore@v5
         with:
           path: ~/.m2/repository
@@ -145,44 +122,30 @@ jobs:
             *) echo "Read '$version' from the flow root pom instead of a snapshot version"; exit 1 ;;
           esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Build and deploy the flow snapshot
-        if: ${{ !inputs.dry-run }}
+      - name: Build the flow snapshot
         working-directory: flow
-        env:
-          SNAPSHOT_USERNAME: ${{ secrets.SNAPSHOT_USERNAME }}
-          SNAPSHOT_PASSWORD: ${{ secrets.SNAPSHOT_PASSWORD }}
-        # Same recipe as flow's own pr-snapshot.yml: -Drelease leaves the
-        # flow-tests modules out of the reactor, maven.javadoc.skip=false makes
-        # the snapshot carry what a release carries, and deployAtEnd holds the
-        # uploads back until the whole reactor has built.
-        run: |
-          mvn deploy -B -ntp -DskipTests -Drelease -Dmaven.javadoc.skip=false \
-            -DdeployAtEnd=true \
-            -DaltDeploymentRepository="vaadin-snapshots::${MAVEN_SNAPSHOT_DEPLOY_URL}"
-      - name: Build only (dry run)
-        if: ${{ inputs.dry-run }}
-        working-directory: flow
+        # Same reactor as flow's own pr-snapshot.yml: -Drelease leaves the
+        # flow-tests modules out. Installed locally rather than deployed; the
+        # jars are handed to the platform job below.
         run: mvn install -B -ntp -DskipTests -Drelease
-      - name: Record the timestamped snapshot id
-        if: ${{ !inputs.dry-run }}
-        id: snapshot
+      - name: Pack the built artifacts
         env:
           VERSION: ${{ steps.version.outputs.version }}
+        # Everything com.vaadin at the snapshot version in the local repository
+        # is exactly what the flow build just installed, metadata included.
         run: |
-          result=$(node scripts/snapshot-id.js --artifact=com.vaadin:flow-server \
-            --version="$VERSION" --repo="$MAVEN_SNAPSHOT_READ_URL")
-          id=$(jq -r .snapshotId <<< "$result")
-          echo "snapshot-id=$id" >> "$GITHUB_OUTPUT"
-          echo "Deployed flow \`$VERSION\` as \`$id\` from \`${{ needs.resolve.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          cd ~/.m2/repository
+          find com/vaadin -type d -name "$VERSION" | tar -czf "$RUNNER_TEMP/flow-m2.tgz" -T -
+      - uses: actions/upload-artifact@v6
+        with:
+          name: flow-m2
+          path: ${{ runner.temp }}/flow-m2.tgz
+          retention-days: 2
 
   assemble-platform:
     needs: [resolve, build-flow]
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      snapshot-id: ${{ steps.snapshot.outputs.snapshot-id }}
-      platform-sha: ${{ steps.platform-sha.outputs.sha }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
@@ -195,18 +158,19 @@ jobs:
         with:
           java-version: '21'
           distribution: temurin
-          server-id: vaadin-snapshots
-          server-username: SNAPSHOT_USERNAME
-          server-password: SNAPSHOT_PASSWORD
       - uses: actions/cache/restore@v5
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-platform-${{ hashFiles('platform/versions.json') }}
           restore-keys: ${{ runner.os }}-maven-platform-
-      - name: Record the platform commit
-        id: platform-sha
-        working-directory: platform
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v7
+        with:
+          name: flow-m2
+          path: ${{ runner.temp }}
+      - name: Install the flow artifacts into the local repository
+        run: |
+          mkdir -p ~/.m2/repository
+          tar -xzf "$RUNNER_TEMP/flow-m2.tgz" -C ~/.m2/repository
       - name: Read the platform version
         id: version
         working-directory: platform
@@ -223,11 +187,12 @@ jobs:
         # The generator reads the npm versions each component pins from
         # META-INF/VAADIN/versions/ of the jars in the local Maven repository.
         # The umbrella vaadin pom depends on every component jar, so resolving
-        # it transitively puts them all there.
+        # it transitively puts them all there. -nsu keeps the remote snapshot
+        # repository from shadowing the flow jars installed above.
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          mvn -B -ntp -f config/prefetch-pom.xml dependency:get \
+          mvn -B -ntp -nsu -f config/prefetch-pom.xml dependency:get \
             -Dartifact=com.vaadin:vaadin:$VERSION:pom
       - name: Pin flow to the just-built snapshot
         env:
@@ -252,80 +217,23 @@ jobs:
           ./scripts/verifyNpmDependencies.sh
       - name: Build the platform
         working-directory: platform
-        run: mvn install -B -ntp -Doss -DskipTests
+        run: mvn install -B -ntp -nsu -Doss -DskipTests
       - name: Check for non-pinned dependencies
         working-directory: platform
         run: ./scripts/checkForNonPinnedDependencies.sh
-      - name: Deploy the platform snapshot
-        if: ${{ !inputs.dry-run }}
-        working-directory: platform
+      - name: Summarize
         env:
-          SNAPSHOT_USERNAME: ${{ secrets.SNAPSHOT_USERNAME }}
-          SNAPSHOT_PASSWORD: ${{ secrets.SNAPSHOT_PASSWORD }}
-        run: |
-          mvn deploy -B -ntp -Doss -DskipTests -DdeployAtEnd=true \
-            -DaltDeploymentRepository="vaadin-snapshots::${MAVEN_SNAPSHOT_DEPLOY_URL}"
-      - name: Record the timestamped snapshot id
-        if: ${{ !inputs.dry-run }}
-        id: snapshot
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          result=$(node scripts/snapshot-id.js --artifact=com.vaadin:vaadin-bom \
-            --version="$VERSION" --repo="$MAVEN_SNAPSHOT_READ_URL")
-          id=$(jq -r .snapshotId <<< "$result")
-          echo "snapshot-id=$id" >> "$GITHUB_OUTPUT"
-          echo "Deployed platform \`$VERSION\` as \`$id\`" >> "$GITHUB_STEP_SUMMARY"
-
-  publish:
-    needs: [resolve, build-flow, assemble-platform]
-    if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          # The branch itself rather than the detached run SHA, so the
-          # manifest pointer below can be committed back.
-          ref: ${{ github.ref_name }}
-      - name: Write the manifest
-        env:
-          PLATFORM_VERSION: ${{ needs.assemble-platform.outputs.version }}
-          PLATFORM_SNAPSHOT_ID: ${{ needs.assemble-platform.outputs.snapshot-id }}
-          PLATFORM_SHA: ${{ needs.assemble-platform.outputs.platform-sha }}
+          PLATFORM_VERSION: ${{ steps.version.outputs.version }}
           FLOW_VERSION: ${{ needs.build-flow.outputs.version }}
-          FLOW_SNAPSHOT_ID: ${{ needs.build-flow.outputs.snapshot-id }}
           FLOW_SHA: ${{ needs.resolve.outputs.sha }}
           FLOW_CHECKS_URL: ${{ needs.resolve.outputs.checks-url }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          component=$(jq -n -c \
-            --arg version "$FLOW_VERSION" --arg snapshotId "$FLOW_SNAPSHOT_ID" \
-            --arg gitHash "$FLOW_SHA" --arg greenEvidence "$FLOW_CHECKS_URL" --arg builtBy "$RUN_URL" \
-            '{name: "flow", version: $version, snapshotId: $snapshotId, gitHash: $gitHash, greenEvidence: $greenEvidence, builtBy: $builtBy}')
-          node scripts/write-manifest.js --out=out \
-            --platform-version="$PLATFORM_VERSION" \
-            --platform-snapshot-id="$PLATFORM_SNAPSHOT_ID" \
-            --platform-ref="$PLATFORM_SHA" \
-            --component="$component"
-          cat out/release-notes.md >> "$GITHUB_STEP_SUMMARY"
-      - name: Commit the manifest pointer
-        run: |
-          mkdir -p manifests
-          cp out/manifest.json manifests/latest.json
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add manifests/latest.json
-          git commit -m "Record snapshot ${{ needs.assemble-platform.outputs.snapshot-id }}"
-          git push
-      - name: Create the pre-release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="snapshot-$(date -u +%Y%m%d%H%M)"
-          gh release create "$tag" out/manifest.json \
-            --prerelease \
-            --target "$(git rev-parse HEAD)" \
-            --title "Platform snapshot ${{ needs.assemble-platform.outputs.snapshot-id }}" \
-            --notes-file out/release-notes.md
+          {
+            echo "## Platform \`$PLATFORM_VERSION\` validated"
+            echo ""
+            echo "| Component | Version | Commit | Evidence |"
+            echo "|-----------|---------|--------|----------|"
+            echo "| flow | \`$FLOW_VERSION\` | [\`${FLOW_SHA:0:7}\`](https://github.com/vaadin/flow/commit/$FLOW_SHA) | [checks]($FLOW_CHECKS_URL) |"
+            echo ""
+            echo "Built and validated, nothing deployed: deploying is still disabled in this prototype."
+          } >> "$GITHUB_STEP_SUMMARY"

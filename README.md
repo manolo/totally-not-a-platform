@@ -1,21 +1,20 @@
 # totally-not-a-platform
 
-A prototype build orchestrator for the Vaadin platform: from ready code to a published, traceable platform snapshot in one pipeline run. The long term goal is "from ready code to release in an hour"; this repo starts by making the snapshot half of that path fast, green and auditable.
+A prototype build orchestrator for the Vaadin platform: from ready code to a validated platform snapshot in one pipeline run. The long term goal is "from ready code to release in an hour"; this repo starts by making the snapshot half of that path fast, green and auditable.
 
 ## What it does (milestone 1: platform + flow)
 
 One workflow, `assemble.yml`, on manual dispatch:
 
 1. **Resolve**: find the newest commit on `vaadin/flow` main whose validation verdict is green. Flow validates through the merge queue, so the check-runs of the merge group are attached to the exact SHA that lands on main. A commit with no validation run (direct push, bot commit) never counts as green.
-2. **Build flow**: check out that commit and deploy it as the regular `25.4-SNAPSHOT` to the snapshot repository, skipping tests, because they already passed in the merge queue for this exact SHA. This replaces the TeamCity flow snapshot build.
-3. **Assemble platform**: check out `vaadin/platform` main, pin flow to `25.4-SNAPSHOT` in `versions.json`, generate the BOM set, build it against the just-published flow, run the platform's fast validations. This replaces the TeamCity platform snapshot build.
-4. **Publish**: deploy the BOMs as `25.4-SNAPSHOT`, write a manifest mapping each component to its exact timestamped snapshot id, git hash and green evidence, and create a GitHub pre-release carrying that manifest.
+2. **Build flow**: check out that commit and build it as the regular `25.4-SNAPSHOT`, skipping tests, because they already passed in the merge queue for this exact SHA.
+3. **Assemble platform**: check out `vaadin/platform` main, pin flow to `25.4-SNAPSHOT` in `versions.json`, generate the BOM set, build it against the just-built flow, run the platform's fast validations.
 
-Existing consumers of `25.4-SNAPSHOT` notice nothing, except that every snapshot they get from this pipeline was built from a commit whose full test suite passed.
+Nothing is deployed yet: the flow artifacts travel between the jobs as a workflow artifact, and the platform resolves them from the local Maven repository. Once this validation pipeline has proven itself, the next step is deploying both to the snapshot repository, replacing the TeamCity flow and platform snapshot builds: existing consumers of `25.4-SNAPSHOT` then notice nothing, except that every snapshot was built from a commit whose full test suite passed.
 
-## Traceability: the manifest
+## Traceability: the manifest (once deploys are enabled)
 
-`-SNAPSHOT` versions are mutable aliases. Every deploy is stored immutably by Maven as `25.4-<yyyyMMdd.HHmmss>-<n>`, and the repository metadata points the alias at the newest one. The manifest written by each run records that timestamped id next to the git hash and the link to the green validation run:
+`-SNAPSHOT` versions are mutable aliases. Every deploy is stored immutably by Maven as `25.4-<yyyyMMdd.HHmmss>-<n>`, and the repository metadata points the alias at the newest one. The manifest written by each deploying run records that timestamped id next to the git hash and the link to the green validation run:
 
 ```json
 { "platformVersion": "25.4-SNAPSHOT",
@@ -44,16 +43,16 @@ All scripts are plain Node.js with no npm dependencies.
 gh workflow run assemble.yml --ref <branch>
 ```
 
-Inputs: `flow-ref` builds an explicit vaadin/flow commit instead of resolving the latest green one, `platform-ref` picks the vaadin/platform ref to assemble from (default `main`), and `dry-run` builds everything but deploys and publishes nothing. When the resolved flow commit is already the one in `manifests/latest.json`, the run is a no-op, which is what will make a cron trigger cheap.
+Inputs: `flow-ref` builds an explicit vaadin/flow commit instead of resolving the latest green one, and `platform-ref` picks the vaadin/platform ref to assemble from (default `main`). When the resolved flow commit is already the one in `manifests/latest.json`, the run is a no-op, which is what will make a cron trigger cheap.
 
 ## Required configuration
 
-Same pattern as flow's `pr-snapshot.yml`:
+None while deploying is disabled: the pipeline runs on the default `GITHUB_TOKEN`. Enabling deploys will need the same pattern as flow's `pr-snapshot.yml`:
 
 - Variable `MAVEN_SNAPSHOT_DEPLOY_URL`: the deploy endpoint of the snapshot repository.
 - Secrets `SNAPSHOT_USERNAME` and `SNAPSHOT_PASSWORD`: credentials allowed to deploy there.
 
-Artifacts are read back from `https://maven.vaadin.com/vaadin-prereleases`.
+Artifacts are then read back from `https://maven.vaadin.com/vaadin-prereleases`.
 
 ## Notes for the production path
 
