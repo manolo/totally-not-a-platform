@@ -100,12 +100,16 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           path: flow
       - uses: ./flow/.github/actions/setup-frontend-tools
+        with:
+          cache: npm
+          cache-dependency-path: flow/flow-client/package-lock.json
       - name: Set up JDK
         uses: actions/setup-java@v5
         with:
           java-version-file: flow/.tool-versions
           distribution: temurin
       - uses: actions/cache/restore@v5
+        id: m2
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-flow-${{ hashFiles('flow/**/pom.xml') }}
@@ -141,6 +145,17 @@ jobs:
           name: flow-m2
           path: ${{ runner.temp }}/flow-m2.tgz
           retention-days: 2
+      - name: Prune snapshots from the Maven cache
+        # A cached com.vaadin snapshot from an earlier run would be stale by
+        # definition. Skipped on an exact key hit, where the entry already
+        # holds what this run would save.
+        if: ${{ steps.m2.outputs.cache-hit != 'true' }}
+        run: find ~/.m2/repository/com/vaadin -type d -name "*-SNAPSHOT" -prune -exec rm -rf {} + 2>/dev/null || true
+      - uses: actions/cache/save@v5
+        if: ${{ steps.m2.outputs.cache-hit != 'true' }}
+        with:
+          path: ~/.m2/repository
+          key: ${{ steps.m2.outputs.cache-primary-key }}
 
   assemble-platform:
     needs: [resolve, build-flow]
@@ -159,10 +174,20 @@ jobs:
           java-version: '21'
           distribution: temurin
       - uses: actions/cache/restore@v5
+        id: m2
+        # The key is computed here, before patch-versions.js rewrites
+        # versions.json; the save below reuses it through cache-primary-key.
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-platform-${{ hashFiles('platform/versions.json') }}
           restore-keys: ${{ runner.os }}-maven-platform-
+      - uses: actions/cache@v5
+        # The npm content-addressed cache cannot go stale, so the plain
+        # restore-and-save action is enough for it.
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-platform-${{ hashFiles('platform/versions.json') }}
+          restore-keys: ${{ runner.os }}-npm-platform-
       - uses: actions/download-artifact@v7
         with:
           name: flow-m2
@@ -227,6 +252,16 @@ jobs:
       - name: Check for non-pinned dependencies
         working-directory: platform
         run: ./scripts/checkForNonPinnedDependencies.sh
+      - name: Prune snapshots from the Maven cache
+        # A cached com.vaadin snapshot from an earlier run would be stale by
+        # definition, and -nsu above would then keep using it forever.
+        if: ${{ steps.m2.outputs.cache-hit != 'true' }}
+        run: find ~/.m2/repository/com/vaadin -type d -name "*-SNAPSHOT" -prune -exec rm -rf {} + 2>/dev/null || true
+      - uses: actions/cache/save@v5
+        if: ${{ steps.m2.outputs.cache-hit != 'true' }}
+        with:
+          path: ~/.m2/repository
+          key: ${{ steps.m2.outputs.cache-primary-key }}
       - name: Summarize
         env:
           PLATFORM_VERSION: ${{ steps.version.outputs.version }}
